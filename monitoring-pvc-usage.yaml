@@ -1,0 +1,211 @@
+zabbix_export:
+  version: '6.4'
+  template_groups:
+    - uuid: 7df96b18c230490a9a0a9e2307226338
+      name: Templates
+  templates:
+    - uuid: f5074ed270a44a41813e65e50ec0de94
+      template: 'Monitoramento de PVCs'
+      name: 'Monitoramento de PVCs'
+      groups:
+        - name: Templates
+      items:
+        - uuid: 1e7bc87fc62b4808b4d6617173fcbead
+          name: 'Persistent Volume Claim'
+          type: SCRIPT
+          key: kube.pvc.metrics
+          delay: 30s
+          trends: '0'
+          value_type: TEXT
+          params: |
+            var Kube = {
+              params: {},
+            
+              setParams: function (params) {
+                ["api_url", "api_token"].forEach(function (field) {
+                  if (
+                    typeof params !== "object" ||
+                    typeof params[field] === "undefined" ||
+                    params[field] === ""
+                  ) {
+                    throw 'Required param is not set: "' + field + '".';
+                  }
+                });
+            
+                Kube.params = params;
+                if (
+                  typeof Kube.params.api_url === "string" &&
+                  !Kube.params.api_url.endsWith("/")
+                ) {
+                  Kube.params.api_url += "/";
+                }
+              },
+            
+              apiRequest: function (query) {
+                var request = new HttpRequest(),
+                  response,
+                  url = encodeURI(Kube.params.api_url + query);
+            
+                if (
+                  typeof Kube.params.http_proxy !== "undefined" &&
+                  Kube.params.http_proxy !== ""
+                ) {
+                  request.setProxy(Kube.params.http_proxy);
+                }
+            
+                request.addHeader("Content-Type: application/json");
+                request.addHeader("Authorization: Bearer " + Kube.params.api_token);
+            
+                Zabbix.log(4, "[ Kubernetes ] Sending request: " + url);
+            
+                if (Kube.params.http_proxy) {
+                  Zabbix.log(
+                    4,
+                    "[ Kubernetes ] Using http proxy: " + Kube.params.http_proxy
+                  );
+                }
+            
+                response = request.get(url);
+            
+                Zabbix.log(
+                  4,
+                  "[ Kubernetes ] Received response with status code " +
+                    request.getStatus() +
+                    ": " +
+                    response
+                );
+            
+                if (request.getStatus() < 200 || request.getStatus() >= 300) {
+                  throw (
+                    "Request failed with status code " +
+                    request.getStatus() +
+                    ": " +
+                    response
+                  );
+                }
+                try {
+                  response = JSON.parse(response);
+                } catch (error) {
+                  throw "Failed to parse response received from Kubernetes API. Check debug log for more information.";
+                }
+                return response;
+              },
+              getNodes: function () {
+                var result = Kube.apiRequest("api/v1/nodes");
+                var nodes = [];
+                if (result["items"]) {
+                  var items = result["items"];
+                  for (var count in items) {
+                    var node_name = items[count].metadata.name;
+                    nodes.push({ name: node_name });
+                  }
+                }
+                return nodes;
+              },
+              bytesToGB: function (bytes) {
+                var gigabytes = Math.round((bytes / (1024 * 1024 * 1024)) * 100) / 100;
+                return gigabytes;
+              },
+              getPVCs: function () {
+                var nodes = Kube.getNodes();
+                var pvcs = [];
+                for (var count in nodes) {
+                  var result = Kube.apiRequest("api/v1/nodes/" + nodes[count].name + "/proxy/stats/summary");
+                  if (result["pods"]) {
+                    var pods = result["pods"];
+                    for (var count in pods) {
+                      var pod = pods[count];
+                      var volume = pod.volume;
+                      if (volume) {
+                        for (var count in volume) {
+                          if (volume[count].pvcRef) {
+                            var pvc = volume[count].pvcRef;
+                            
+                            var percentUsed = parseFloat(((volume[count].usedBytes / volume[count].capacityBytes) * 100).toFixed(2));
+                            pvcs.push({ name: pvc.name, namespace: pvc.namespace, pod: pod.podRef.name, percentUsed: percentUsed , usedBytes: Kube.bytesToGB(volume[count].usedBytes), capacityBytes: Kube.bytesToGB(volume[count].capacityBytes), availableBytes: Kube.bytesToGB(volume[count].availableBytes)});
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+                return JSON.stringify(pvcs);
+              },
+            };
+            
+            try {
+              Kube.setParams(JSON.parse(value));
+            
+              stateMetrics = Kube.getPVCs();
+            
+              return stateMetrics;
+            } catch (error) {
+              error += String(error).endsWith(".") ? "" : ".";
+              Zabbix.log(3, "[ Kubernetes ] ERROR: " + error);
+            }
+          parameters:
+            - name: api_token
+              value: '{$KUBE.API.TOKEN}'
+            - name: api_url
+              value: '{$KUBE.API.URL}'
+            - name: http_proxy
+              value: '{$KUBE.HTTP.PROXY}'
+      discovery_rules:
+        - uuid: df012691f1954586b9baad50f01ac988
+          name: 'PVC Discovery'
+          type: DEPENDENT
+          key: kube.pvc.metric
+          delay: '0'
+          item_prototypes:
+            - uuid: eaa87a4f55114f08b89b97eb39627866
+              name: 'pvc: {#NAME}'
+              type: DEPENDENT
+              key: 'kube.pvc.get[{#NAME}]'
+              delay: '0'
+              value_type: FLOAT
+              units: '%'
+              description: |
+                PVC: {#NAME}
+                Namespace: {#NAMESPACE}
+                Pod: {#POD}
+                Capacidade de armazenamento: {#CAPACITY} GB
+                Armazenamento disponível: {#AVAILABLE} GB
+                Armazenamento utilizado: {#USED} GB
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - '$.[?(@[''name''] == "{#NAME}")].percentUsed'
+                - type: REGEX
+                  parameters:
+                    - '[+-]?(\d*\.)?\d+'
+                    - \0
+              master_item:
+                key: kube.pvc.metrics
+              tags:
+                - tag: namespace
+                  value: '{#NAMESPACE}'
+                - tag: object
+                  value: pvc
+                - tag: pvc
+                  value: '{#NAME}'
+              trigger_prototypes:
+                - uuid: 5516481bd1ba4cc9bfb17f26f60ff6c1
+                  expression: 'last(/Monitoramento de PVCs/kube.pvc.get[{#NAME}])>80'
+                  name: '{#NAME} usage is higher than 80%'
+                  priority: WARNING
+                  manual_close: 'YES'
+          master_item:
+            key: kube.pvc.metrics
+          lld_macro_paths:
+            - lld_macro: '{#AVAILABLE}'
+              path: $.availableBytes
+            - lld_macro: '{#CAPACITY}'
+              path: $.capacityBytes
+            - lld_macro: '{#NAMESPACE}'
+              path: $.namespace
+            - lld_macro: '{#NAME}'
+              path: $.name
+            - lld_macro: '{#POD}'
+              path: $.pod
+            - lld_macro: '{#USED}'
+              path: $.usedBytes
